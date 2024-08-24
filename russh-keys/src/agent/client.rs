@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
 use byteorder::{BigEndian, ByteOrder};
-use log::{debug, info};
+use log::debug;
 use russh_cryptovec::CryptoVec;
 use tokio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -9,16 +9,35 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use super::{msg, Constraint};
 use crate::encoding::{Encoding, Reader};
 use crate::key::{PublicKey, SignatureHash};
-use crate::{key, Error};
+use crate::{key, protocol, Error, PublicKeyBase64};
+
+pub trait AgentStream: AsyncRead + AsyncWrite {}
+
+impl<S: AsyncRead + AsyncWrite> AgentStream for S {}
 
 /// SSH agent client.
-pub struct AgentClient<S: AsyncRead + AsyncWrite> {
+pub struct AgentClient<S: AgentStream> {
     stream: S,
     buf: CryptoVec,
 }
 
+impl<S: AgentStream + Send + Unpin + 'static> AgentClient<S> {
+    /// Wraps the internal stream in a Box<dyn _>, allowing different client
+    /// implementations to have the same type
+    pub fn dynamic(self) -> AgentClient<Box<dyn AgentStream + Send + Unpin + 'static>> {
+        AgentClient {
+            stream: Box::new(self.stream),
+            buf: self.buf,
+        }
+    }
+
+    pub fn into_inner(self) -> Box<dyn AgentStream + Send + Unpin + 'static> {
+        Box::new(self.stream)
+    }
+}
+
 // https://tools.ietf.org/html/draft-miller-ssh-agent-00#section-4.1
-impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
+impl<S: AgentStream + Unpin> AgentClient<S> {
     /// Build a future that connects to an SSH agent via the provided
     /// stream (on Unix, usually a Unix-domain socket).
     pub fn connect(stream: S) -> Self {
@@ -31,7 +50,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
 
 #[cfg(unix)]
 impl AgentClient<tokio::net::UnixStream> {
-    /// Build a future that connects to an SSH agent via the provided
+    /// Connect to an SSH agent via the provided
     /// stream (on Unix, usually a Unix-domain socket).
     pub async fn connect_uds<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         let stream = tokio::net::UnixStream::connect(path).await?;
@@ -41,8 +60,8 @@ impl AgentClient<tokio::net::UnixStream> {
         })
     }
 
-    /// Build a future that connects to an SSH agent via the provided
-    /// stream (on Unix, usually a Unix-domain socket).
+    /// Connect to an SSH agent specified by the SSH_AUTH_SOCK
+    /// environment variable.
     pub async fn connect_env() -> Result<Self, Error> {
         let var = if let Ok(var) = std::env::var("SSH_AUTH_SOCK") {
             var
@@ -58,16 +77,39 @@ impl AgentClient<tokio::net::UnixStream> {
     }
 }
 
-#[cfg(not(unix))]
-impl AgentClient<tokio::net::TcpStream> {
-    /// Build a future that connects to an SSH agent via the provided
-    /// stream (on Unix, usually a Unix-domain socket).
-    pub async fn connect_env() -> Result<Self, Error> {
-        Err(Error::AgentFailure)
+#[cfg(windows)]
+const ERROR_PIPE_BUSY: u32 = 231u32;
+
+#[cfg(windows)]
+impl AgentClient<pageant::PageantStream> {
+    /// Connect to a running Pageant instance
+    pub async fn connect_pageant() -> Self {
+        Self::connect(pageant::PageantStream::new())
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
+#[cfg(windows)]
+impl AgentClient<tokio::net::windows::named_pipe::NamedPipeClient> {
+    /// Connect to an SSH agent via a Windows named pipe
+    pub async fn connect_named_pipe<P: AsRef<std::ffi::OsStr>>(path: P) -> Result<Self, Error> {
+        let stream = loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(path.as_ref()) {
+                Ok(client) => break client,
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => (),
+                Err(e) => return Err(e.into()),
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        };
+
+        Ok(AgentClient {
+            stream,
+            buf: CryptoVec::new(),
+        })
+    }
+}
+
+impl<S: AgentStream + Unpin> AgentClient<S> {
     async fn read_response(&mut self) -> Result<(), Error> {
         // Writing the message
         self.stream.write_all(&self.buf).await?;
@@ -87,6 +129,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         Ok(())
     }
 
+    async fn read_success(&mut self) -> Result<(), Error> {
+        self.read_response().await?;
+        if self.buf.first() == Some(&msg::SUCCESS) {
+            Ok(())
+        } else {
+            Err(Error::AgentFailure)
+        }
+    }
+
     /// Send a key to the agent, with a (possibly empty) slice of
     /// constraints to apply when using the key to sign.
     pub async fn add_identity(
@@ -94,6 +145,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         key: &key::KeyPair,
         constraints: &[Constraint],
     ) -> Result<(), Error> {
+        // See IETF draft-miller-ssh-agent-13, section 3.2 for format.
+        // https://datatracker.ietf.org/doc/html/draft-miller-ssh-agent
         self.buf.clear();
         self.buf.resize(4);
         if constraints.is_empty() {
@@ -110,33 +163,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
                 self.buf.extend(pair.verifying_key().as_bytes());
                 self.buf.extend_ssh_string(b"");
             }
-            #[cfg(feature = "openssl")]
             #[allow(clippy::unwrap_used)] // key is known to be private
             key::KeyPair::RSA { ref key, .. } => {
                 self.buf.extend_ssh_string(b"ssh-rsa");
-                self.buf.extend_ssh_mpint(&key.n().to_vec());
-                self.buf.extend_ssh_mpint(&key.e().to_vec());
-                self.buf.extend_ssh_mpint(&key.d().to_vec());
-                if let Some(iqmp) = key.iqmp() {
-                    self.buf.extend_ssh_mpint(&iqmp.to_vec());
-                } else {
-                    let mut ctx = openssl::bn::BigNumContext::new()?;
-                    let mut iqmp = openssl::bn::BigNum::new()?;
-                    iqmp.mod_inverse(key.p().unwrap(), key.q().unwrap(), &mut ctx)?;
-                    self.buf.extend_ssh_mpint(&iqmp.to_vec());
-                }
-                self.buf.extend_ssh_mpint(&key.p().unwrap().to_vec());
-                self.buf.extend_ssh_mpint(&key.q().unwrap().to_vec());
-                self.buf.extend_ssh_string(b"");
+                self.buf
+                    .extend_ssh(&protocol::RsaPrivateKey::try_from(key)?);
+            }
+            key::KeyPair::EC { ref key } => {
+                self.buf.extend_ssh_string(key.algorithm().as_bytes());
+                self.buf.extend_ssh_string(key.ident().as_bytes());
+                self.buf
+                    .extend_ssh_string(&key.to_public_key().to_sec1_bytes());
+                self.buf.extend_ssh_mpint(&key.to_secret_bytes());
+                self.buf.extend_ssh_string(b""); // comment
             }
         }
         if !constraints.is_empty() {
-            self.buf.push_u32_be(constraints.len() as u32);
             for cons in constraints {
                 match *cons {
                     Constraint::KeyLifetime { seconds } => {
                         self.buf.push(msg::CONSTRAIN_LIFETIME);
-                        self.buf.push_u32_be(seconds)
+                        self.buf.push_u32_be(seconds);
                     }
                     Constraint::Confirm => self.buf.push(msg::CONSTRAIN_CONFIRM),
                     Constraint::Extensions {
@@ -153,7 +200,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         let len = self.buf.len() - 4;
         BigEndian::write_u32(&mut self.buf[..], len as u32);
 
-        self.read_response().await?;
+        self.read_success().await?;
         Ok(())
     }
 
@@ -243,34 +290,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
             let mut r = self.buf.reader(1);
             let n = r.read_u32()?;
             for _ in 0..n {
-                let key = r.read_string()?;
-                let _ = r.read_string()?;
-                let mut r = key.reader(0);
-                let t = r.read_string()?;
-                debug!("t = {:?}", std::str::from_utf8(t));
-                match t {
-                    #[cfg(feature = "openssl")]
-                    b"ssh-rsa" => {
-                        let e = r.read_mpint()?;
-                        let n = r.read_mpint()?;
-                        use openssl::bn::BigNum;
-                        use openssl::pkey::PKey;
-                        use openssl::rsa::Rsa;
-                        keys.push(PublicKey::RSA {
-                            key: key::OpenSSLPKey(PKey::from_rsa(Rsa::from_public_components(
-                                BigNum::from_slice(n)?,
-                                BigNum::from_slice(e)?,
-                            )?)?),
-                            hash: SignatureHash::SHA2_512,
-                        })
-                    }
-                    b"ssh-ed25519" => keys.push(PublicKey::Ed25519(
-                        ed25519_dalek::VerifyingKey::try_from(r.read_string()?)?,
-                    )),
-                    t => {
-                        info!("Unsupported key type: {:?}", std::str::from_utf8(t))
-                    }
-                }
+                let key_blob = r.read_string()?;
+                let _comment = r.read_string()?;
+                keys.push(key::parse_public_key(
+                    key_blob,
+                    Some(SignatureHash::SHA2_512),
+                )?);
             }
         }
 
@@ -322,7 +347,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         self.buf.extend_ssh_string(data);
         debug!("public = {:?}", public);
         let hash = match public {
-            #[cfg(feature = "openssl")]
             PublicKey::RSA { hash, .. } => match hash {
                 SignatureHash::SHA2_256 => 2,
                 SignatureHash::SHA2_512 => 4,
@@ -467,8 +491,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         self.buf.clear();
         self.buf.resize(4);
         self.buf.push(msg::REMOVE_ALL_IDENTITIES);
-        BigEndian::write_u32(&mut self.buf[..], 5);
-        self.read_response().await?;
+        BigEndian::write_u32(&mut self.buf[..], 1);
+        self.read_success().await?;
         Ok(())
     }
 
@@ -505,14 +529,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
 
 fn key_blob(public: &key::PublicKey, buf: &mut CryptoVec) -> Result<(), Error> {
     match *public {
-        #[cfg(feature = "openssl")]
         PublicKey::RSA { ref key, .. } => {
             buf.extend(&[0, 0, 0, 0]);
             let len0 = buf.len();
             buf.extend_ssh_string(b"ssh-rsa");
-            let rsa = key.0.rsa()?;
-            buf.extend_ssh_mpint(&rsa.e().to_vec());
-            buf.extend_ssh_mpint(&rsa.n().to_vec());
+            buf.extend_ssh(&protocol::RsaPublicKey::from(key));
             let len1 = buf.len();
             #[allow(clippy::indexing_slicing)] // length is known
             BigEndian::write_u32(&mut buf[5..], (len1 - len0) as u32);
@@ -525,6 +546,9 @@ fn key_blob(public: &key::PublicKey, buf: &mut CryptoVec) -> Result<(), Error> {
             let len1 = buf.len();
             #[allow(clippy::indexing_slicing)] // length is known
             BigEndian::write_u32(&mut buf[5..], (len1 - len0) as u32);
+        }
+        PublicKey::EC { .. } => {
+            buf.extend_ssh_string(&public.public_key_bytes());
         }
     }
     Ok(())

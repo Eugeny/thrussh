@@ -16,10 +16,12 @@
 use std::sync::Arc;
 
 use bitflags::bitflags;
-use russh_cryptovec::CryptoVec;
-use russh_keys::{encoding, key};
+use ssh_key::Certificate;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::keys::{encoding, key};
+use crate::CryptoVec;
 
 bitflags! {
     /// Set of authentication methods, represented by bit flags.
@@ -77,10 +79,22 @@ impl<R: AsyncRead + AsyncWrite + Unpin + Send + 'static> Signer
 #[derive(Debug)]
 pub enum Method {
     None,
-    Password { password: String },
-    PublicKey { key: Arc<key::KeyPair> },
-    FuturePublicKey { key: key::PublicKey },
-    KeyboardInteractive { submethods: String },
+    Password {
+        password: String,
+    },
+    PublicKey {
+        key: Arc<key::KeyPair>,
+    },
+    OpenSSHCertificate {
+        key: Arc<key::KeyPair>,
+        cert: Certificate,
+    },
+    FuturePublicKey {
+        key: key::PublicKey,
+    },
+    KeyboardInteractive {
+        submethods: String,
+    },
     // Hostbased,
 }
 

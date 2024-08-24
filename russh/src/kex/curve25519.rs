@@ -3,13 +3,12 @@ use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
 use log::debug;
-use russh_cryptovec::CryptoVec;
-use russh_keys::encoding::Encoding;
 
 use super::{compute_keys, KexAlgorithm, KexType};
+use crate::keys::encoding::Encoding;
 use crate::mac::{self};
 use crate::session::Exchange;
-use crate::{cipher, msg};
+use crate::{cipher, msg, CryptoVec};
 
 pub struct Curve25519KexType {}
 
@@ -103,9 +102,7 @@ impl KexAlgorithm for Curve25519Kex {
     }
 
     fn compute_shared_secret(&mut self, remote_pubkey_: &[u8]) -> Result<(), crate::Error> {
-        let local_secret =
-            std::mem::replace(&mut self.local_secret, None).ok_or(crate::Error::KexInit)?;
-
+        let local_secret = self.local_secret.take().ok_or(crate::Error::KexInit)?;
         let mut remote_pubkey = MontgomeryPoint([0; 32]);
         remote_pubkey.0.clone_from_slice(remote_pubkey_);
         let shared = local_secret * remote_pubkey;
