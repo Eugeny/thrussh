@@ -5,7 +5,7 @@ use bytes::Bytes;
 use log::debug;
 use russh_cryptovec::CryptoVec;
 use ssh_encoding::{Decode, Encode, Reader};
-use ssh_key::{Algorithm, HashAlg, PrivateKey, PublicKey, Signature};
+use ssh_key::{Algorithm, PrivateKey, PublicKey, Signature};
 use tokio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -316,13 +316,9 @@ impl<S: AgentStream + Unpin> AgentClient<S> {
         data.encode(&mut self.buf)?;
         debug!("public = {:?}", public);
         let hash = match public.algorithm() {
-            Algorithm::Rsa {
-                hash: Some(HashAlg::Sha256),
-            } => 2,
-            Algorithm::Rsa {
-                hash: Some(HashAlg::Sha512),
-            } => 4,
-            Algorithm::Rsa { hash: None } => 0,
+            // for RSA keys ask for SHA-512 digest to be used
+            Algorithm::Rsa { .. } => 4,
+            // for all other keys leave flags unset (zero)
             _ => 0,
         };
         hash.encode(&mut self.buf)?;
